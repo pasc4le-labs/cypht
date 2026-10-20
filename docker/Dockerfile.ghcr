@@ -1,0 +1,24 @@
+# Cypht image for the codegiik/GIIKS deployment (GHCR).
+#
+# Upstream's image has one defect that breaks a SQLite install: the entrypoint
+# runs `scripts/setup_database.php` as root, so the SQLite file it creates is
+# owned by root while nginx/php-fpm run as www-data (uid 33). The first write
+# from the web app then fails with "attempt to write a readonly database".
+#
+# This image only replaces the entrypoint with a wrapper that pre-creates the
+# database file and hands /var/lib/hm3 to www-data before delegating to the
+# stock `docker-entrypoint.sh` - see docker/entrypoint-www-data.sh. Nothing else
+# is changed, and nothing is rebuilt: the base is upstream's own multi-arch
+# image (linux/amd64, linux/arm64, linux/arm/v7), which is what makes this a
+# ~30s build instead of a full PHP/composer rebuild under QEMU.
+#
+# Published by .github/workflows/ghcr-image.yml:
+#   ghcr.io/pasc4le-labs/cypht:v2.13.0-r1
+
+ARG CYPHT_VERSION=2.13.0
+FROM cypht/cypht:${CYPHT_VERSION}
+
+COPY docker/entrypoint-www-data.sh /usr/local/bin/entrypoint-www-data.sh
+RUN chmod 0755 /usr/local/bin/entrypoint-www-data.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-www-data.sh"]

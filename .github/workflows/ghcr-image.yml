@@ -1,0 +1,145 @@
+name: GHCR image
+
+# Publishes ghcr.io/pasc4le-labs/cypht:<tag> (multi-arch) and smoke-tests the
+# pushed image. Tag format: v<upstream version>[-rN], e.g. v2.13.0-r1:
+# the upstream version becomes the base image tag, the rest is our revision.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive the upstream base version from the tag
+        id: base
+        run: |
+          # v2.13.0-r1 -> 2.13.0
+          version="$(printf '%s' "${GITHUB_REF_NAME#v}" | cut -d- -f1)"
+          echo "Parsing '${GITHUB_REF_NAME}' as base version '${version}'"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image name
+        id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.ghcr
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            CYPHT_VERSION=${{ steps.base.outputs.version }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.title=cypht (www-data entrypoint fix)
+
+  smoke:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run the pushed image and assert the SQLite install works
+        run: |
+          set -euo pipefail
+          image="${{ needs.publish.outputs.image }}:${{ github.ref_name }}"
+          docker pull "$image"
+
+          work="$RUNNER_TEMP/cypht"
+          mkdir -p "$work/db" "$work/users" "$work/attachments"
+
+          docker run -d --name cypht-smoke -p 18080:80 \
+            -e APP_NAME=Cypht \
+            -e AUTH_TYPE=DB -e AUTH_USERNAME=admin -e AUTH_PASSWORD=smoke-pass-1234 \
+            -e USER_CONFIG_TYPE=DB -e SESSION_TYPE=DB \
+            -e DB_CONNECTION_TYPE=host -e DB_DRIVER=sqlite \
+            -e DB_NAME=/var/lib/hm3/db/cypht.db \
+            -e ENABLE_REDIS=false -e ENABLE_MEMCACHED=false \
+            -e DEFAULT_SETTING_TIMEZONE=Europe/Rome \
+            -e CYPHT_MODULES=core,contacts,local_contacts,jmap,imap,smtp,account,idle_timer,desktop_notifications,calendar,themes,nux,profiles,imap_folders,sievefilters,tags,history,scheduled_sends \
+            -v "$work/db:/var/lib/hm3/db" \
+            -v "$work/users:/var/lib/hm3/users" \
+            -v "$work/attachments:/var/lib/hm3/attachments" \
+            "$image"
+          trap 'docker logs cypht-smoke || true; docker rm -f cypht-smoke || true' EXIT
+
+          code=""
+          for _ in $(seq 60); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/ || true)"
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          if [ "$code" != "200" ]; then
+            echo "::error::cypht did not answer 200 (last=$code)"
+            exit 1
+          fi
+
+          # 1. the fix under test: the SQLite file must belong to www-data (33)
+          owner="$(stat -c %u "$work/db/cypht.db")"
+          if [ "$owner" != "33" ]; then
+            echo "::error::database owner is uid $owner, expected 33 (www-data)"
+            exit 1
+          fi
+
+          # 2. and php-fpm's user must really be able to write it
+          docker exec -u www-data cypht-smoke php -r \
+            '$p = new PDO("sqlite:/var/lib/hm3/db/cypht.db"); $p->exec("create table if not exists smoke_w (a)");'
+
+          # 3. a real login: form key -> POST -> authenticated page
+          page="$RUNNER_TEMP/page.html"
+          jar="$RUNNER_TEMP/jar"
+          curl -s -c "$jar" -o "$page" http://127.0.0.1:18080/
+          key="$(grep -o 'name="hm_page_key" value="[^"]*"' "$page" | head -1 | sed 's/.*value="//;s/"//')"
+          if [ -z "$key" ]; then
+            echo "::error::no hm_page_key on the login page"
+            exit 1
+          fi
+          curl -s -b "$jar" -c "$jar" -o /dev/null \
+            -d "username=admin&password=smoke-pass-1234&hm_page_key=$key" \
+            http://127.0.0.1:18080/
+          if ! curl -s -b "$jar" http://127.0.0.1:18080/ | grep -q "Logout"; then
+            echo "::error::login did not establish a session"
+            exit 1
+          fi
+
+          # 4. negative control: a bad password must be rejected
+          jar2="$RUNNER_TEMP/jar2"
+          curl -s -c "$jar2" -o "$page" http://127.0.0.1:18080/
+          key2="$(grep -o 'name="hm_page_key" value="[^"]*"' "$page" | head -1 | sed 's/.*value="//;s/"//')"
+          if ! curl -s -L -b "$jar2" -c "$jar2" \
+                 -d "username=admin&password=wrong&hm_page_key=$key2" \
+                 http://127.0.0.1:18080/ | grep -q "Invalid username or password"; then
+            echo "::error::a bad password was not rejected"
+            exit 1
+          fi
+
+          echo "smoke ok: 200 on /, db uid 33, login works, bad password rejected"
